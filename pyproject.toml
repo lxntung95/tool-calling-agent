@@ -1,7 +1,7 @@
 # Project metadata and dependencies; uv.lock is auto-generated from this file
 [project]
 name = "viral-pulse"                    # Project name; also the .venv prompt label
-version = "0.1.0"                       # Your project's own version (not Python's)
+version = "1.0.0"                       # Your project's own version (not Python's)
 description = "Viral Pulse: a tool-calling agent for weekly COVID-19, flu, and RSV activity near you, from CDC wastewater data"
 requires-python = ">=3.12"              # Minimum Python version this project runs on
 dependencies = [                        # Direct dependencies; ">=" sets a minimum version
