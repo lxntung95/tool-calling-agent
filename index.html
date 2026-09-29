@@ -13,6 +13,9 @@
             href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400&family=IBM+Plex+Sans:wght@400;500;600&display=swap"
             rel="stylesheet"
         />
+        <!-- Markdown rendering for replies: marked converts Markdown to HTML, DOMPurify strips anything unsafe -->
+        <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
         <style>
             /* LOOK: colors, fonts, spacing, layout */
 
@@ -177,6 +180,16 @@
                 animation: pulse 0.9s steps(1) infinite;
             }
 
+            /* Formatting inside rendered replies (lists, paragraphs, bold) */
+            .content p + p,
+            .content p + ul,
+            .content ul + p { margin-top: 0.6rem; }
+            .content ul,
+            .content ol { padding-left: 1.2rem; margin-top: 0.3rem; }
+            .content li + li { margin-top: 0.2rem; }
+            .content strong { font-weight: 600; }
+            .content code { font-family: var(--font-mono); font-size: 0.85em; }
+
             /* Tool calls the harness ran */
             .tool {
                 max-width: 85%;
@@ -294,21 +307,32 @@
                 statusEl.querySelector(".status-text").textContent = working ? "Working" : "Ready";
             }
 
+            // Add a message bubble; text is inserted as plain text, never as HTML
             function addMessage(role, text, isLoading = false) {
                 const div = document.createElement("div");
                 div.className =
                     "msg " +
                     (role === "you" ? "user" : "assistant") +
                     (isLoading ? " loading" : "");
-                div.innerHTML =
-                    '<div class="role">' +
-                    role +
-                    '</div><div class="content">' +
-                    text +
-                    "</div>";
+                const roleEl = document.createElement("div");
+                roleEl.className = "role";
+                roleEl.textContent = role;
+                const content = document.createElement("div");
+                content.className = "content";
+                content.textContent = text;
+                div.append(roleEl, content);
                 messages.appendChild(div);
                 messages.scrollTop = messages.scrollHeight;
                 return div;
+            }
+
+            // Show the agent's Markdown reply as formatted HTML; fall back to plain text if the libraries did not load
+            function showReply(contentEl, markdown) {
+                if (window.marked && window.DOMPurify) {
+                    contentEl.innerHTML = DOMPurify.sanitize(marked.parse(markdown));
+                } else {
+                    contentEl.textContent = markdown;
+                }
             }
 
             async function send() {
@@ -348,8 +372,7 @@
                         );
                         messages.insertBefore(div, loading);
                     }
-                    loading.querySelector(".content").textContent =
-                        data.response;
+                    showReply(loading.querySelector(".content"), data.response);
                     loading.classList.remove("loading");
                 } catch (e) {
                     loading.querySelector(".content").textContent =
