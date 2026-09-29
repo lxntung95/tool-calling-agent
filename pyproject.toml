@@ -1,12 +1,13 @@
+# Project metadata and dependencies; uv.lock is auto-generated from this file
 [project]
-name = "gemini-web-tool-calling"
-version = "0.1.0"
+name = "gemini-web-tool-calling"        # Project name; also the .venv prompt label
+version = "0.1.0"                       # Your project's own version (not Python's)
 description = "qwen-tool-calling behind a web server: FastAPI + LiteLLM + Gemini, with tool calls shown in the UI"
-requires-python = ">=3.10"
-dependencies = [
-    "fastapi>=0.109.0",
-    "uvicorn>=0.27.0",
-    "litellm>=1.50",
-    "google-cloud-aiplatform>=1.40.0",
-    "requests>=2.31",
+requires-python = ">=3.10"              # Minimum Python version this project runs on
+dependencies = [                        # Direct dependencies; ">=" sets a minimum version
+    "fastapi>=0.109.0",                 # Web framework: routes, request/response validation
+    "uvicorn>=0.27.0",                  # Server that runs the FastAPI app
+    "litellm>=1.50",                    # One interface for calling many model providers
+    "google-cloud-aiplatform>=1.40.0",  # Google Cloud libraries for Vertex AI, including authentication
+    "requests>=2.31",                   # HTTP client the tools use to call external APIs
 ]
