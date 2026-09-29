@@ -1,109 +1,275 @@
+<!-- Chat frontend, served by app.py at "/". Sends messages to POST /chat and displays the reply and tool calls. -->
 <!doctype html>
 <html lang="en">
     <head>
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <title>Gemini Web Tool Calling</title>
+        <title>Tool-calling agent</title>
+        <!-- Tab icon embedded directly, so the browser does not request /favicon.ico -->
+        <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M0 0h24l8 8v24H0z' fill='%2334e07a'/%3E%3C/svg%3E" />
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+        <link
+            href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400&family=IBM+Plex+Sans:wght@400;500;600&display=swap"
+            rel="stylesheet"
+        />
         <style>
+            /* LOOK: colors, fonts, spacing, layout */
+
+            /* Colors: light by default, dark when the OS is in dark mode */
+            :root {
+                color-scheme: light dark;
+                --bg: #f3f5f3;          /* page background */
+                --bar: #e8ece9;         /* header and input bar */
+                --border: #cfd6d1;      /* dividers */
+                --text: #161a17;
+                --muted: #68716b;
+                --user-bg: #e1e7e3;     /* your messages */
+                --accent-fill: #2fcf6e; /* signature green: button, header accent, typing cursor */
+                --accent-ink: #06140b;  /* text on green */
+                --accent-line: #17733f; /* deeper green, readable as text and thin lines on light */
+                --tool: #4e6a80;        /* tool-call accent: gunmetal steel */
+                --tool-bg: #e6ebee;
+
+                --font-body: "IBM Plex Sans", system-ui, sans-serif;
+                --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+                --col: 760px;           /* width of the conversation column */
+                --gutter: 2rem;         /* minimum side padding */
+            }
+            @media (prefers-color-scheme: dark) {
+                :root {
+                    --bg: #0b0d0c;
+                    --bar: #111512;
+                    --border: #222a24;
+                    --text: #dde3de;
+                    --muted: #7d8880;
+                    --user-bg: #19201b;
+                    --accent-fill: #34e07a;
+                    --accent-ink: #06140b;
+                    --accent-line: #34e07a;
+                    --tool: #8ea4b5;
+                    --tool-bg: #131a1d;
+                }
+            }
+
             * {
                 box-sizing: border-box;
                 margin: 0;
                 padding: 0;
             }
+            ::selection {
+                background: var(--accent-fill);
+                color: var(--accent-ink);
+            }
             body {
-                font-family: system-ui, sans-serif;
+                font-family: var(--font-body);
+                font-size: 1rem;
+                background: var(--bg);
+                color: var(--text);
                 height: 100vh;
+                height: 100dvh; /* accounts for mobile browser toolbars */
                 display: flex;
-                justify-content: center;
+                flex-direction: column;
+            }
+
+            /* Centers content in a readable column while bars span the full width */
+            .inner {
+                width: min(var(--col), 100% - 2 * var(--gutter));
+                margin-inline: auto;
+            }
+
+            /* Header: agent name, one-line description, live status */
+            #header {
+                background: var(--bar);
+                border-bottom: 1px solid color-mix(in srgb, var(--accent-line) 35%, var(--border));
+            }
+            #header .inner {
+                position: relative;
+                display: flex;
+                justify-content: space-between;
+                align-items: flex-end;
+                gap: 1rem;
+                padding: 1.25rem 0 1rem;
+            }
+            #header .inner::after {
+                content: "";
+                position: absolute;
+                left: 0;
+                bottom: -2px;
+                width: 56px;
+                height: 3px;
+                background: var(--accent-fill);
+            }
+            h1 {
+                font-weight: 600;
+                font-size: 1.3rem;
+                letter-spacing: -0.01em;
+                line-height: 1.2;
+            }
+            #tagline {
+                color: var(--muted);
+                font-size: 0.95rem;
+                margin-top: 0.2rem;
+            }
+            #status {
+                display: flex;
                 align-items: center;
-                padding: 3rem 1rem;
+                gap: 0.5rem;
+                font-size: 0.85rem;
+                color: var(--muted);
+                white-space: nowrap;
             }
-            #container {
-                width: 100%;
-                max-width: 900px;
-                display: flex;
-                flex-direction: column;
-                border: 1px solid #e0e0e0;
+            #status .dot {
+                width: 7px;
+                height: 7px;
+                background: var(--accent-line);
             }
+            #status.working .dot {
+                animation: pulse 0.9s ease-in-out infinite;
+            }
+            @keyframes pulse {
+                50% { opacity: 0.25; }
+            }
+
+            /* Conversation: scrolls full width, content stays in the column */
             #messages {
+                flex: 1;
                 overflow-y: auto;
-                padding: 2rem;
+                padding: 2rem max(var(--gutter), (100% - var(--col)) / 2);
                 display: flex;
                 flex-direction: column;
-                gap: 1.5rem;
-                min-height: 450px;
-                max-height: 70vh;
+                gap: 1.4rem;
             }
             .msg {
-                line-height: 1.5;
-                max-width: 80%;
+                line-height: 1.6;
+                max-width: 85%;
+            }
+            .msg .role {
+                font-size: 0.8rem;
+                font-weight: 500;
+                color: var(--muted);
+                margin-bottom: 0.3rem;
+            }
+            .msg.assistant .role {
+                color: var(--accent-line);
+            }
+            .msg.assistant .content {
+                border-left: 2px solid var(--border);
+                padding-left: 0.9rem;
             }
             .msg.user {
                 align-self: flex-end;
-                text-align: right;
-            }
-            .msg .role {
-                font-size: 0.75rem;
-                text-transform: uppercase;
-                letter-spacing: 0.05em;
-                color: #999;
-                margin-bottom: 0.25rem;
+                background: var(--user-bg);
+                padding: 0.7rem 1rem;
+                clip-path: polygon(0 0, 100% 0, 100% calc(100% - 10px), calc(100% - 10px) 100%, 0 100%);
             }
             .msg.loading .content {
-                color: #999;
+                color: var(--muted);
             }
-            #input-area {
+            .msg.loading .content::after {
+                content: "";
+                display: inline-block;
+                width: 0.5em;
+                height: 1em;
+                margin-left: 0.3em;
+                vertical-align: -0.15em;
+                background: var(--accent-fill);
+                animation: pulse 0.9s steps(1) infinite;
+            }
+
+            /* Tool calls the harness ran */
+            .tool {
+                max-width: 85%;
+                font-family: var(--font-mono);
+                font-size: 0.78rem;
+                line-height: 1.5;
+                color: var(--muted);
+                background: var(--tool-bg);
+                border-left: 2px solid var(--tool);
+                padding: 0.55rem 0.8rem;
+                white-space: pre-wrap;
+                word-break: break-word;
+            }
+            .tool .label {
+                color: var(--tool);
+            }
+
+            /* Input bar, docked at the bottom */
+            #input-bar {
+                background: var(--bar);
+                border-top: 1px solid var(--border);
+            }
+            #input-bar .inner {
                 display: flex;
                 gap: 1rem;
-                padding: 1.5rem;
-                border-top: 1px solid #e0e0e0;
+                padding: 1rem 0 1.25rem;
             }
             #user-input {
                 flex: 1;
                 padding: 0.75rem 0;
                 border: none;
-                border-bottom: 1px solid #e0e0e0;
+                border-bottom: 1px solid var(--border);
+                background: transparent;
+                color: var(--text);
+                font-family: var(--font-body);
                 font-size: 1rem;
                 outline: none;
+                transition: border-color 0.15s;
             }
             #user-input:focus {
-                border-bottom-color: #000;
+                border-bottom-color: var(--accent-line);
+            }
+            #user-input::placeholder {
+                color: var(--muted);
             }
             button {
-                padding: 0.75rem 1.5rem;
-                background: #000;
-                color: #fff;
+                padding: 0.75rem 1.75rem;
+                background: var(--accent-fill);
+                color: var(--accent-ink);
                 border: none;
-                font-size: 0.75rem;
-                text-transform: uppercase;
-                letter-spacing: 0.05em;
+                font-family: var(--font-body);
+                font-weight: 600;
+                font-size: 0.95rem;
                 cursor: pointer;
+                clip-path: polygon(0 0, 100% 0, 100% calc(100% - 10px), calc(100% - 10px) 100%, 0 100%);
             }
-            .tool {
-                font-family: ui-monospace, monospace;
-                font-size: 0.75rem;
-                color: #555;
-                background: #f5f5f5;
-                border-left: 3px solid #f59e0b;
-                padding: 0.5rem 0.75rem;
-                margin: 0.25rem 0 0.75rem;
-                white-space: pre-wrap;
-                word-break: break-word;
+            button:hover {
+                filter: brightness(1.08);
             }
-            .tool .label {
-                text-transform: uppercase;
-                letter-spacing: 0.05em;
-                color: #b45309;
+            button:focus-visible {
+                outline: 2px solid var(--text);
+                outline-offset: -4px;
             }
             button:disabled {
-                opacity: 0.3;
+                opacity: 0.35;
+                cursor: default;
+            }
+
+            /* Small screens */
+            @media (max-width: 600px) {
+                :root { --gutter: 1.1rem; }
+                #tagline { display: none; }
+                .msg, .tool { max-width: 92%; }
+            }
+            @media (prefers-reduced-motion: reduce) {
+                * { animation: none !important; transition: none !important; }
             }
         </style>
     </head>
     <body>
-        <div id="container">
-            <div id="messages"></div>
-            <div id="input-area">
+        <!-- STRUCTURE: header bar (name, description, status), conversation, input bar -->
+        <header id="header">
+            <div class="inner">
+                <div>
+                    <h1>Tool-calling agent</h1>
+                    <p id="tagline">Ask a question. Tools the agent runs appear inline with their results.</p>
+                </div>
+                <div id="status"><span class="dot"></span><span class="status-text">Ready</span></div>
+            </div>
+        </header>
+        <main id="messages"></main>
+        <footer id="input-bar">
+            <div class="inner">
                 <input
                     type="text"
                     id="user-input"
@@ -112,12 +278,21 @@
                 />
                 <button id="send-btn">Send</button>
             </div>
-        </div>
+        </footer>
         <script>
+            // BEHAVIOR: sends messages to /chat, keeps sessionId, renders the reply and tool calls
+            // Keep the /chat contract: send {message, session_id}; read response, session_id, tool_calls
             const messages = document.getElementById("messages");
             const userInput = document.getElementById("user-input");
             const sendBtn = document.getElementById("send-btn");
+            const statusEl = document.getElementById("status");
             let sessionId = null;
+
+            // Header status: "Working" while waiting on the agent, "Ready" otherwise
+            function setStatus(working) {
+                statusEl.classList.toggle("working", working);
+                statusEl.querySelector(".status-text").textContent = working ? "Working" : "Ready";
+            }
 
             function addMessage(role, text, isLoading = false) {
                 const div = document.createElement("div");
@@ -142,8 +317,9 @@
 
                 userInput.value = "";
                 sendBtn.disabled = true;
+                setStatus(true);
                 addMessage("you", text);
-                const loading = addMessage("assistant", "Thinking...", true);
+                const loading = addMessage("assistant", "Thinking", true);
 
                 try {
                     const res = await fetch("/chat", {
@@ -180,6 +356,8 @@
                         "Error: " + e.message;
                     loading.classList.remove("loading");
                 }
+                messages.scrollTop = messages.scrollHeight;
+                setStatus(false);
                 sendBtn.disabled = false;
                 userInput.focus();
             }
