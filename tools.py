@@ -13,6 +13,35 @@ GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"  # place name -> 
 COUNTY_URL = "https://geo.fcc.gov/api/census/area"              # coordinates -> county (FCC Area API)
 CDC_WVAL_URL = "https://data.cdc.gov/resource/atcp-73re.json"   # CDC NWSS site-level wastewater levels
 
+# Emerging threats: CDC sample-level datasets that record whether each sample detected the virus
+EMERGING_THREATS = {
+    "Measles": {
+        "url": "https://data.cdc.gov/resource/akvg-8vrb.json",
+        "caveat": "Measures wild-type measles virus. A detection means at least one sample was positive; "
+                  "no detection does not rule out infections in the community.",
+    },
+    "H5 bird flu": {
+        "url": "https://data.cdc.gov/resource/mtpu-urpp.json",
+        "caveat": "H5 can enter wastewater from animal sources such as birds or milk, so a detection "
+                  "does not confirm that any person is infected.",
+    },
+}
+
+# US states, DC, and Puerto Rico -> postal code; lets tools accept a state on its own ("California")
+US_STATES = {
+    "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR", "California": "CA", "Colorado": "CO",
+    "Connecticut": "CT", "Delaware": "DE", "District of Columbia": "DC", "Florida": "FL", "Georgia": "GA",
+    "Hawaii": "HI", "Idaho": "ID", "Illinois": "IL", "Indiana": "IN", "Iowa": "IA", "Kansas": "KS",
+    "Kentucky": "KY", "Louisiana": "LA", "Maine": "ME", "Maryland": "MD", "Massachusetts": "MA",
+    "Michigan": "MI", "Minnesota": "MN", "Mississippi": "MS", "Missouri": "MO", "Montana": "MT",
+    "Nebraska": "NE", "Nevada": "NV", "New Hampshire": "NH", "New Jersey": "NJ", "New Mexico": "NM",
+    "New York": "NY", "North Carolina": "NC", "North Dakota": "ND", "Ohio": "OH", "Oklahoma": "OK",
+    "Oregon": "OR", "Pennsylvania": "PA", "Puerto Rico": "PR", "Rhode Island": "RI", "South Carolina": "SC",
+    "South Dakota": "SD", "Tennessee": "TN", "Texas": "TX", "Utah": "UT", "Vermont": "VT", "Virginia": "VA",
+    "Washington": "WA", "West Virginia": "WV", "Wisconsin": "WI", "Wyoming": "WY",
+}
+STATE_BY_LOWER = {name.lower(): name for name in US_STATES}
+
 # The three viruses in the dataset, matched by how their pathogen_target text starts
 VIRUSES = {"COVID-19": "sars", "Influenza A": "influenza a", "RSV": "rsv"}
 
@@ -21,14 +50,23 @@ MAX_LOCAL_LAG_WEEKS = 3  # county data may be up to this many weeks older than t
 WEEKS_OF_HISTORY = TREND_WEEKS + MAX_LOCAL_LAG_WEEKS + 1  # how far back tool 1 fetches
 MIN_SITES_TO_RANK = 5  # states with fewer reporting sites are left out of national rankings (too noisy)
 HIGH_LEVELS = {"High", "Very High"}  # CDC categories counted as elevated in rankings
+EMERGING_WINDOW_WEEKS = 6  # look-back for detections; CDC's own display uses the past six weeks
 
 
 # --- HELPERS (shared by tools; the model never sees these) ---
 
 def geocode(location: str) -> dict:
-    """Place name -> {name, state, lat, lon}. Accepts 'City' or 'City, State'. Raises ValueError with advice."""
+    """Place name -> {name, state, state_code, lat, lon}. Accepts 'City, State', 'City', or a state alone
+    ('California', which returns no coordinates). Raises ValueError with advice."""
     name, _, state_hint = location.partition(",")  # "Austin, Texas" -> "Austin", "Texas"
-    resp = requests.get(GEOCODE_URL, params={"name": name.strip(), "count": 10}, timeout=10)
+    name, hint = name.strip(), state_hint.strip().lower()
+
+    # A bare state name means the whole state; otherwise 'California' would match a town called California
+    if not hint and name.lower() in STATE_BY_LOWER:
+        state = STATE_BY_LOWER[name.lower()]
+        return {"name": state, "state": state, "state_code": US_STATES[state].lower(), "lat": None, "lon": None}
+
+    resp = requests.get(GEOCODE_URL, params={"name": name, "count": 10}, timeout=10)
     resp.raise_for_status()
     results = resp.json().get("results") or []
     us = [r for r in results if r.get("country_code") == "US"]
@@ -36,22 +74,34 @@ def geocode(location: str) -> dict:
         if results:
             raise ValueError(f"'{location}' is outside the US. Wastewater data only covers US locations.")
         raise ValueError(f"Could not find '{location}'. Try a city or county name with its full state, e.g. 'Austin, Texas'.")
-    hint = state_hint.strip().lower()
     match = next((r for r in us if hint and r.get("admin1", "").lower() == hint), us[0])  # prefer the named state
-    return {"name": match["name"], "state": match.get("admin1", ""), "lat": match["latitude"], "lon": match["longitude"]}
+    state = match.get("admin1", "")
+    return {
+        "name": match["name"], "state": state, "state_code": US_STATES.get(state, "").lower(),
+        "lat": match["latitude"], "lon": match["longitude"],
+    }
 
 
-def county_at(lat: float, lon: float) -> str | None:
-    """Coordinates -> county name without its suffix ('Kings'), or None if the lookup fails."""
+def county_info(lat: float | None, lon: float | None) -> dict | None:
+    """Coordinates -> {'name': 'Kings', 'fips': '36047', 'state_code': 'ny'}, or None if unavailable."""
+    if lat is None or lon is None:
+        return None  # a whole-state request has no single county
     try:
         resp = requests.get(COUNTY_URL, params={"lat": lat, "lon": lon, "format": "json"}, timeout=10)
         resp.raise_for_status()
-        county = resp.json()["results"][0]["county_name"]
+        result = resp.json()["results"][0]
+        name = result["county_name"]
     except (requests.RequestException, KeyError, IndexError, ValueError):
-        return None  # not fatal: the tool falls back to state-level data
+        return None  # not fatal: tools fall back to state-level data
     for suffix in (" County", " Parish", " Borough"):
-        county = county.removesuffix(suffix)
-    return county
+        name = name.removesuffix(suffix)
+    return {"name": name, "fips": result.get("county_fips"), "state_code": (result.get("state_code") or "").lower()}
+
+
+def county_at(lat: float | None, lon: float | None) -> str | None:
+    """Coordinates -> county name without its suffix ('Kings'), or None if the lookup fails."""
+    info = county_info(lat, lon)
+    return info["name"] if info else None
 
 
 def soql_text(value: str) -> str:
@@ -59,11 +109,16 @@ def soql_text(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def query_cdc(params: dict) -> list[dict]:
-    """Run one filtered query against the CDC wastewater dataset and return its rows."""
-    resp = requests.get(CDC_WVAL_URL, params=params, timeout=30)
+def query_socrata(url: str, params: dict) -> list[dict]:
+    """Run one filtered query against a data.cdc.gov dataset and return its rows."""
+    resp = requests.get(url, params=params, timeout=30)
     resp.raise_for_status()  # turn HTTP errors (400, 500) into exceptions the tools can report
     return resp.json()
+
+
+def query_cdc(params: dict) -> list[dict]:
+    """Run one filtered query against the CDC wastewater activity-level dataset."""
+    return query_socrata(CDC_WVAL_URL, params)
 
 
 def serves_county(row: dict, county: str) -> bool:
@@ -146,6 +201,32 @@ def summarize_week(rows: list[dict], week: str) -> dict:
     }
 
 
+def summarize_detections(rows: list[dict]) -> dict:
+    """Sites and samples tested, and which of them detected the virus (pcr_target_detect == 'yes')."""
+    detected = [r for r in rows if (r.get("pcr_target_detect") or "").lower() == "yes"]
+    return {
+        "sites_tested": len({r.get("site") for r in rows}),
+        "samples_tested": len(rows),
+        "sites_with_detection": len({r.get("site") for r in detected}),
+        "samples_with_detection": len(detected),
+        "last_detection": max((r["sample_collect_date"][:10] for r in detected), default=None),
+    }
+
+
+def county_not_tested(url: str, state_code: str, county: dict) -> str:
+    """Explain that a county had no testing in the window, including when it was last tested, if ever."""
+    message = f"no sites in {county['name']} County tested for this in the window"
+    try:
+        last = query_socrata(url, {
+            "$select": "max(sample_collect_date) AS last",
+            "$where": f"state_territory = {soql_text(state_code)} AND county_fips like {soql_text('%' + county['fips'] + '%')}",
+        })
+    except requests.RequestException:
+        return message  # the extra context is optional; keep the main answer
+    last_date = (last[0].get("last") or "")[:10] if last else ""
+    return f"{message} (last tested {last_date})" if last_date else f"{message} (no testing on record)"
+
+
 # --- TOOLS ---
 
 def get_current_activity(location: str) -> str:
@@ -188,10 +269,14 @@ def get_current_activity(location: str) -> str:
             summary = summarize_week(state_rows, state_week)
             summary["area_used"] = f"all of {place['state']}"
             summary["data_week_ending"] = state_week
-            summary["note"] = f"No recent sites in {county or 'this'} County reported this virus, so this is statewide."
+            summary["note"] = (
+                f"No recent sites in {county} County reported this virus, so this is statewide." if county
+                else "Statewide reading."
+            )
         viruses[virus] = summary
 
-    return json.dumps({"place": f"{place['name']}, {place['state']}", "county": county, "viruses": viruses})
+    place_label = place["state"] if place["lat"] is None else f"{place['name']}, {place['state']}"
+    return json.dumps({"place": place_label, "county": county, "viruses": viruses})
 
 
 def get_historical_comparison(location: str, virus: str, weeks_ago: int = 52) -> str:
@@ -258,10 +343,13 @@ def get_historical_comparison(location: str, virus: str, weeks_ago: int = 52) ->
         }
 
     return json.dumps({
-        "place": f"{place['name']}, {place['state']}",
+        "place": place["state"] if place["lat"] is None else f"{place['name']}, {place['state']}",
         "virus": virus,
         "area_used": area,
-        "note": None if area.endswith("County") else f"{county or 'This'} County lacked data in one of the periods, so both readings are statewide.",
+        "note": None if area.endswith("County") else (
+            f"{county} County lacked data in one of the periods, so both readings are statewide." if county
+            else "Statewide comparison."
+        ),
         "now": snapshot(recent, now_week),
         "then": snapshot(past, then_week),
         "change": direction(level_now, level_then, "higher now", "lower now", "about the same"),
@@ -347,6 +435,68 @@ def get_national_rankings(virus: str, top_n: int = 5, order: str = "highest") ->
     })
 
 
+def get_emerging_threats(location: str) -> str:
+    """Recent wastewater detections of measles and H5 bird flu near a US place (county and state)."""
+    try:
+        place = geocode(location)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+    county = county_info(place["lat"], place["lon"])  # None for a whole-state request
+    state_code = (county or {}).get("state_code") or place["state_code"]
+    if not state_code:
+        return json.dumps({"error": f"Could not identify the state for '{location}'. Try a city with its full state name."})
+
+    threats = {}
+    for threat, source in EMERGING_THREATS.items():
+        try:
+            # Anchor the window on the newest sample nationally, since uploads lag collection
+            newest = query_socrata(source["url"], {"$select": "max(sample_collect_date) AS latest"})
+            newest_date = (newest[0].get("latest") or "")[:10] if newest else ""
+            if not newest_date:
+                threats[threat] = {"status": "no recent national data available"}
+                continue
+            start = (date.fromisoformat(newest_date) - timedelta(weeks=EMERGING_WINDOW_WEEKS)).isoformat()
+            rows = query_socrata(source["url"], {
+                "$select": "site, county_fips, counties_served, sample_collect_date, pcr_target_detect",
+                "$where": f"state_territory = {soql_text(state_code)} AND sample_collect_date >= '{start}'",
+                "$limit": 50000,
+            })
+        except requests.RequestException as e:
+            threats[threat] = {"error": f"The CDC data service did not respond ({type(e).__name__}); report this threat as unavailable."}
+            continue
+
+        window = f"{start} to {newest_date}"
+        if not rows:
+            threats[threat] = {"window": window, "status": f"no sites in {place['state']} tested for this in the window", "caveat": source["caveat"]}
+            continue
+
+        # Match the county by FIPS code; a site can serve several counties, listed like "36081, 36061, 36047"
+        county_rows = [
+            r for r in rows
+            if county and county["fips"] in (f.strip() for f in (r.get("county_fips") or "").split(","))
+        ]
+        state_summary = summarize_detections(rows)
+        state_summary["counties_with_detection"] = sorted({
+            r.get("counties_served") or "unknown" for r in rows if (r.get("pcr_target_detect") or "").lower() == "yes"
+        })
+        threats[threat] = {
+            "window": window,
+            "county": (
+                summarize_detections(county_rows) if county_rows
+                else county_not_tested(source["url"], state_code, county) if county
+                else "not applicable (whole-state request)"
+            ),
+            "state": state_summary,
+            "caveat": source["caveat"],
+        }
+
+    return json.dumps({
+        "place": place["name"] if not county else f"{place['name']}, {place['state']}",
+        "county": f"{county['name']} County" if county else None,
+        "threats": threats,
+    })
+
+
 # --- TOOL DEFINITIONS: what the model sees ("set notes" in the screenplay) ---
 
 TOOLS = [
@@ -367,7 +517,7 @@ TOOLS = [
                 "properties": {
                     "location": {
                         "type": "string",
-                        "description": "US city or county with its full state name, e.g. 'Brooklyn, New York' or 'Las Vegas, Nevada'",
+                        "description": "US city or county with its full state name, e.g. 'Brooklyn, New York' or 'Las Vegas, Nevada', or a state alone for statewide data, e.g. 'California'",
                     },
                 },
                 "required": ["location"],
@@ -389,7 +539,7 @@ TOOLS = [
                 "properties": {
                     "location": {
                         "type": "string",
-                        "description": "US city or county with its full state name, e.g. 'Brooklyn, New York'",
+                        "description": "US city or county with its full state name, e.g. 'Brooklyn, New York', or a state alone for statewide data, e.g. 'California'",
                     },
                     "virus": {
                         "type": "string",
@@ -437,6 +587,29 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_emerging_threats",
+            "description": (
+                "Check CDC wastewater testing for recent detections of measles and H5 bird flu near a US place, "
+                "over roughly the past six weeks. Returns, for the place's county and its whole state, how many sites "
+                "and samples were tested and how many detected each virus, with the date of the latest detection and "
+                "a caveat on interpreting it. Use this when asked about measles, bird flu, or other emerging threats; "
+                "it does not cover COVID-19, flu, or RSV."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "US city or county with its full state name, e.g. 'Brooklyn, New York', or a state alone for statewide data, e.g. 'California'",
+                    },
+                },
+                "required": ["location"],
+            },
+        },
+    },
 ]
 
 # What the harness runs: tool name -> Python function
@@ -444,6 +617,7 @@ TOOL_MAP = {
     "get_current_activity": get_current_activity,
     "get_historical_comparison": get_historical_comparison,
     "get_national_rankings": get_national_rankings,
+    "get_emerging_threats": get_emerging_threats,
 }
 
 # Fail at startup, not mid-conversation, if a schema and the map disagree
