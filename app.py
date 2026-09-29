@@ -31,6 +31,8 @@ even in the top states, say activity is low nationally.
 factually with their dates and include the tool's caveat; a detection is a signal to stay informed, not proof of \
 local cases, and no detection does not guarantee absence. If a county has not been tested recently, say when it \
 was last tested, since statewide results may not reflect that area.
+- For where to get a vaccine, a test, or same-day care, call find_nearby_care with 'pharmacy' or 'urgent care'. \
+List a few places with addresses and phone numbers, and always pass on its caveat to call ahead.
 - The data covers COVID-19, influenza A, RSV, measles, and H5 bird flu only; say so if asked about anything else.
 
 How to answer:

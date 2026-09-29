@@ -1,6 +1,7 @@
 """The tools the harness can run, and the JSON that describes them to the model."""
 
 import json
+import re
 from collections import Counter
 from datetime import date, timedelta
 from statistics import median
@@ -12,6 +13,10 @@ import requests
 GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"  # place name -> coordinates, state
 COUNTY_URL = "https://geo.fcc.gov/api/census/area"              # coordinates -> county (FCC Area API)
 CDC_WVAL_URL = "https://data.cdc.gov/resource/atcp-73re.json"   # CDC NWSS site-level wastewater levels
+NPI_URL = "https://npiregistry.cms.hhs.gov/api/"                # CMS registry of licensed healthcare providers
+
+# Care types the model can ask for -> NPI taxonomy search term (matches "Pharmacy", "Clinic/Center, Urgent Care")
+CARE_TYPES = {"pharmacy": "pharmacy", "urgent care": "urgent care"}
 
 # Emerging threats: CDC sample-level datasets that record whether each sample detected the virus
 EMERGING_THREATS = {
@@ -51,6 +56,7 @@ WEEKS_OF_HISTORY = TREND_WEEKS + MAX_LOCAL_LAG_WEEKS + 1  # how far back tool 1 
 MIN_SITES_TO_RANK = 5  # states with fewer reporting sites are left out of national rankings (too noisy)
 HIGH_LEVELS = {"High", "Very High"}  # CDC categories counted as elevated in rankings
 EMERGING_WINDOW_WEEKS = 6  # look-back for detections; CDC's own display uses the past six weeks
+NPI_FETCH_LIMIT = 200      # the registry's maximum per request
 
 
 # --- HELPERS (shared by tools; the model never sees these) ---
@@ -64,7 +70,7 @@ def geocode(location: str) -> dict:
     # A bare state name means the whole state; otherwise 'California' would match a town called California
     if not hint and name.lower() in STATE_BY_LOWER:
         state = STATE_BY_LOWER[name.lower()]
-        return {"name": state, "state": state, "state_code": US_STATES[state].lower(), "lat": None, "lon": None}
+        return {"name": state, "state": state, "state_code": US_STATES[state].lower(), "lat": None, "lon": None, "postcodes": []}
 
     resp = requests.get(GEOCODE_URL, params={"name": name, "count": 10}, timeout=10)
     resp.raise_for_status()
@@ -79,6 +85,7 @@ def geocode(location: str) -> dict:
     return {
         "name": match["name"], "state": state, "state_code": US_STATES.get(state, "").lower(),
         "lat": match["latitude"], "lon": match["longitude"],
+        "postcodes": match.get("postcodes") or [],  # ZIP codes for the place, when the geocoder has them
     }
 
 
@@ -497,6 +504,90 @@ def get_emerging_threats(location: str) -> str:
     })
 
 
+def tidy_title(text: str) -> str:
+    """Title-case registry text without mangling ordinals: '25TH AVE' -> '25th Ave', not '25Th Ave'."""
+    return re.sub(r"(\d)(St|Nd|Rd|Th)\b", lambda m: m.group(1) + m.group(2).lower(), text.title())
+
+
+def find_nearby_care(location: str, care_type: str, max_results: int = 5) -> str:
+    """Pharmacies or urgent care centers registered in a US city, from the federal NPI Registry."""
+    if care_type not in CARE_TYPES:
+        return json.dumps({"error": f"Unknown care_type '{care_type}'. Use one of: {list(CARE_TYPES)}."})
+    max_results = max(1, min(int(max_results), 10))
+    try:
+        place = geocode(location)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+    if place["lat"] is None:
+        return json.dumps({"error": f"'{location}' is a whole state. Ask the user for a city or neighborhood, e.g. 'Astoria, New York'."})
+
+    try:
+        resp = requests.get(NPI_URL, params={
+            "version": "2.1",
+            "city": place["name"],
+            "state": place["state_code"].upper(),
+            "taxonomy_description": CARE_TYPES[care_type],
+            "enumeration_type": "NPI-2",  # organizations, not individual clinicians
+            "limit": NPI_FETCH_LIMIT,
+        }, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+    except (requests.RequestException, ValueError) as e:
+        return json.dumps({"error": f"The provider registry did not respond ({type(e).__name__}). Tell the user it is temporarily unavailable."})
+    if data.get("Errors"):
+        return json.dumps({"error": f"The provider registry rejected the search: {data['Errors']}"})
+
+    providers = []
+    for r in data.get("results") or []:
+        basic = r.get("basic") or {}
+        if basic.get("status") != "A":
+            continue  # skip deactivated registrations
+        location_addr = next((a for a in r.get("addresses") or [] if a.get("address_purpose") == "LOCATION"), None)
+        if not location_addr:
+            continue
+        # A "Doing Business As" name is usually the one on the storefront
+        dba = next((o.get("organization_name") for o in r.get("other_names") or [] if o.get("type") == "Doing Business As"), None)
+        zip5 = (location_addr.get("postal_code") or "")[:5]
+        street = ", ".join(x for x in (location_addr.get("address_1"), location_addr.get("address_2")) if x)
+        providers.append({
+            "name": tidy_title(dba or basic.get("organization_name") or "Unknown"),
+            "address": f"{tidy_title(street)}, {tidy_title(location_addr.get('city') or '')}, {location_addr.get('state')} {zip5}",
+            "phone": location_addr.get("telephone_number"),
+            "zip": zip5,
+            "last_updated": basic.get("last_updated") or "",
+        })
+
+    if not providers:
+        return json.dumps({
+            "error": f"No active {care_type} registrations found for {place['name']}, {place['state']}. "
+                     f"Try the nearest larger city, or the other care type."
+        })
+
+    # The registry returns results alphabetically, so rank them: ZIP codes inside the place first,
+    # then the most recently updated registrations (more likely to be current)
+    local_zips = set(place["postcodes"])
+    providers.sort(key=lambda p: p["last_updated"], reverse=True)  # newest first...
+    providers.sort(key=lambda p: p["zip"] not in local_zips)       # ...then local ZIPs ahead (sort is stable)
+    shown = [{k: v for k, v in p.items() if k != "last_updated"} for p in providers[:max_results]]
+
+    return json.dumps({
+        "place": f"{place['name']}, {place['state']}",
+        "care_type": care_type,
+        "providers": shown,
+        "registered_matches": len(providers),
+        # The registry caps one search at 200; if we hit it, these are a sample, not the full list
+        "note": (
+            f"{place['name']} has more registered {care_type} locations than one search returns; these are a sample."
+            if len(data.get("results") or []) >= NPI_FETCH_LIMIT else None
+        ),
+        "caveat": (
+            "From the federal NPI Registry of licensed providers. It does not show opening hours, walk-in "
+            "availability, or vaccine and test stock, and listings can be out of date; call ahead. "
+            "For vaccine availability, vaccines.gov lists locations with current stock."
+        ),
+    })
+
+
 # --- TOOL DEFINITIONS: what the model sees ("set notes" in the screenplay) ---
 
 TOOLS = [
@@ -610,6 +701,36 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_nearby_care",
+            "description": (
+                "Find pharmacies or urgent care centers registered in a US city or neighborhood, from the federal "
+                "NPI Registry. Returns names, addresses, and phone numbers. Use this when the user asks where to get "
+                "a vaccine, a test, or same-day care. It cannot show hours or stock, so always pass on its caveat."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "US city or neighborhood with its full state name, e.g. 'Astoria, New York'. Not a state alone.",
+                    },
+                    "care_type": {
+                        "type": "string",
+                        "enum": list(CARE_TYPES),
+                        "description": "'pharmacy' for vaccines and many tests; 'urgent care' for same-day visits",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "How many places to list, 1 to 10. Default 5.",
+                    },
+                },
+                "required": ["location", "care_type"],
+            },
+        },
+    },
 ]
 
 # What the harness runs: tool name -> Python function
@@ -618,6 +739,7 @@ TOOL_MAP = {
     "get_historical_comparison": get_historical_comparison,
     "get_national_rankings": get_national_rankings,
     "get_emerging_threats": get_emerging_threats,
+    "find_nearby_care": find_nearby_care,
 }
 
 # Fail at startup, not mid-conversation, if a schema and the map disagree
