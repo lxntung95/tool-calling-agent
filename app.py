@@ -15,11 +15,27 @@ from tools import TOOLS, run_tool
 
 # --- CONFIGURATION ---
 
-# Needs to be updated based on what I decide the agent should do and how it should behave
-SYSTEM_PROMPT = (
-    "You are a helpful assistant. When a question depends on the weather or "
-    "outdoor conditions, call get_weather first, then answer in a sentence."
-)
+# Instructions sent as the first message of every session; add one routing line per tool as each tool is built
+SYSTEM_PROMPT = """You are Viral Pulse, an assistant that reports how much COVID-19, influenza A, and RSV \
+is circulating in US communities, based on CDC wastewater surveillance data.
+
+How to answer:
+- Always state which week the data covers.
+- Describe activity levels (very low, low, moderate, high, very high) and trends in plain language. \
+Wastewater levels reflect how much virus is circulating in a community, not any individual's risk.
+- Never estimate case counts or the number of people infected; wastewater data cannot support that.
+- If a tool reports no recent data for a place, say so and offer the nearest place that has data.
+- Keep answers concise: a few sentences, or a short list when comparing places.
+
+Safety:
+- Do not give personal medical advice or diagnoses. When levels are high, you may mention general \
+precautions such as vaccination, handwashing, and staying home when sick, and point the user to cdc.gov \
+or their healthcare provider.
+- If someone describes severe symptoms or an emergency, tell them to contact a healthcare provider or call 911.
+
+Scope:
+- If asked about something unrelated to respiratory virus activity, briefly explain what you can help with.
+"""
 MAX_TOOL_ROUNDS = 5  # Maximum number of tool call rounds the agent can make before giving up
 
 
@@ -56,8 +72,16 @@ def run_agent(messages: list[dict]) -> tuple[str, list[dict]]:
         for call in reply.tool_calls:
             assert isinstance(call, ChatCompletionMessageToolCall)  # All TOOLS are "function" type, so every call is a function call
             name = call.function.name or ""                         # Which tool the model asked for; "" falls through to unknown-tool error
-            args = json.loads(call.function.arguments)              # Model's arguments: JSON string -> Python dict
-            result = run_tool(name, args)                           # Run the matching Python function, get a JSON string back
+            
+            # Model's arguments: JSON string -> Python dict; broken JSON goes back to the model as an error
+            try:
+                args = json.loads(call.function.arguments)
+            except json.JSONDecodeError as e:
+                args = {}
+                result = json.dumps({"error": f"Arguments for {name} were not valid JSON ({e}). Resend the call with a JSON object."})
+            else:
+                result = run_tool(name, args)  # Run the matching Python function, get a JSON string back
+            
             tool_calls += [{"name": name, "args": args, "result": result}]
 
             messages += [{"role": "tool", "tool_call_id": call.id, "content": result}]
@@ -106,6 +130,9 @@ def chat(request: ChatRequest):
     if session_id not in sessions:
         sessions[session_id] = [{"role": "system", "content": SYSTEM_PROMPT}]  # Start history with the SYSTEM_PROMPT
 
+    # Remember where this turn starts, so a failed turn can be undone
+    checkpoint = len(sessions[session_id])
+
     # Append user's message to the context
     sessions[session_id] += [{"role": "user", "content": request.message}]
 
@@ -113,7 +140,9 @@ def chat(request: ChatRequest):
     try:
         response, tool_calls = run_agent(sessions[session_id])
     except Exception as e:
-        # Auth, billing, a model that is not running: show it in the chat, not as a 500.
+        # Undo the failed turn so a half-finished tool exchange can't break the next message
+        del sessions[session_id][checkpoint:]
+        # Auth, billing, a model that is not running: show it in the chat, not as a 500
         response, tool_calls = f"Model call failed: {type(e).__name__}: {str(e)[:300]}", []
 
     return ChatResponse(response=response, session_id=session_id, tool_calls=tool_calls)
