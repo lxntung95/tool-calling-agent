@@ -114,6 +114,11 @@
                 font-size: 0.95rem;
                 margin-top: 0.2rem;
             }
+            #header-actions {
+                display: flex;
+                align-items: center;
+                gap: 1.25rem;
+            }
             #status {
                 display: flex;
                 align-items: center;
@@ -190,7 +195,7 @@
             .content strong { font-weight: 600; }
             .content code { font-family: var(--font-mono); font-size: 0.85em; }
 
-            /* Tool calls the harness ran */
+            /* Tool calls the harness ran: one summary line, click to expand the full result */
             .tool {
                 max-width: 85%;
                 font-family: var(--font-mono);
@@ -199,12 +204,46 @@
                 color: var(--muted);
                 background: var(--tool-bg);
                 border-left: 2px solid var(--tool);
+            }
+            .tool summary {
+                list-style: none; /* hide the default triangle; the chevron below replaces it */
+                cursor: pointer;
                 padding: 0.55rem 0.8rem;
-                white-space: pre-wrap;
-                word-break: break-word;
+                display: flex;
+                gap: 0.6rem;
+                align-items: baseline;
+            }
+            .tool summary::-webkit-details-marker {
+                display: none;
+            }
+            .tool summary::before {
+                content: "\203A"; /* single right-pointing angle, rotates when open */
+                color: var(--tool);
+                display: inline-block;
+                transition: transform 0.15s;
+            }
+            .tool[open] summary::before {
+                transform: rotate(90deg);
+            }
+            .tool summary:focus-visible {
+                outline: 2px solid var(--tool);
+                outline-offset: -2px;
             }
             .tool .label {
                 color: var(--tool);
+                white-space: nowrap;
+            }
+            .tool .call {
+                overflow-wrap: anywhere;
+            }
+            .tool pre {
+                margin: 0;
+                padding: 0 0.8rem 0.7rem 1.9rem;
+                max-height: 320px;
+                overflow: auto;
+                white-space: pre-wrap;
+                word-break: break-word;
+                font-family: var(--font-mono);
             }
 
             /* Input bar, docked at the bottom */
@@ -257,6 +296,20 @@
                 opacity: 0.35;
                 cursor: default;
             }
+            /* Secondary button: outlined, so Send stays the only filled accent */
+            #new-chat-btn {
+                padding: 0.4rem 0.9rem;
+                white-space: nowrap;
+                background: transparent;
+                color: var(--text);
+                border: 1px solid var(--border);
+                font-weight: 500;
+                font-size: 0.85rem;
+            }
+            #new-chat-btn:hover {
+                border-color: var(--accent-line);
+                filter: none;
+            }
 
             /* Small screens */
             @media (max-width: 600px) {
@@ -270,14 +323,17 @@
         </style>
     </head>
     <body>
-        <!-- STRUCTURE: header bar (name, description, status), conversation, input bar -->
+        <!-- STRUCTURE: header bar (name, description, status, New chat), conversation, input bar -->
         <header id="header">
             <div class="inner">
                 <div>
                     <h1>Viral Pulse</h1>
-                    <p id="tagline">Weekly COVID-19, flu, and RSV activity near you, from CDC wastewater data.</p>
+                    <p id="tagline">COVID-19, flu, RSV, measles, and bird flu near you, from CDC wastewater.</p>
                 </div>
-                <div id="status"><span class="dot"></span><span class="status-text">Ready</span></div>
+                <div id="header-actions">
+                    <div id="status"><span class="dot"></span><span class="status-text">Ready</span></div>
+                    <button id="new-chat-btn" type="button" title="Start a new conversation">New chat</button>
+                </div>
             </div>
         </header>
         <main id="messages"></main>
@@ -293,12 +349,13 @@
             </div>
         </footer>
         <script>
-            // BEHAVIOR: sends messages to /chat, keeps sessionId, renders the reply and tool calls
+            // BEHAVIOR: sends messages to /chat, keeps sessionId, renders the reply and tool calls; New chat calls /clear
             // Keep the /chat contract: send {message, session_id}; read response, session_id, tool_calls
             const messages = document.getElementById("messages");
             const userInput = document.getElementById("user-input");
             const sendBtn = document.getElementById("send-btn");
             const statusEl = document.getElementById("status");
+            const newChatBtn = document.getElementById("new-chat-btn");
             let sessionId = null;
 
             // Header status: "Working" while waiting on the agent, "Ready" otherwise
@@ -335,12 +392,55 @@
                 }
             }
 
+            // One tool call as a collapsible block: the summary shows the call, the body shows the full result
+            function renderToolCall(call) {
+                const details = document.createElement("details");
+                details.className = "tool";
+
+                const summary = document.createElement("summary");
+                const label = document.createElement("span");
+                label.className = "label";
+                label.textContent = "tool call";
+                const signature = document.createElement("span");
+                signature.className = "call";
+                const args = Object.values(call.args || {}).map((v) => JSON.stringify(v)).join(", ");
+                signature.textContent = call.name + "(" + args + ")";
+                summary.append(label, signature);
+
+                // Pretty-print the result when it is JSON; otherwise show it as-is
+                const body = document.createElement("pre");
+                try {
+                    body.textContent = JSON.stringify(JSON.parse(call.result), null, 2);
+                } catch {
+                    body.textContent = String(call.result);
+                }
+
+                details.append(summary, body);
+                return details;
+            }
+
+            // New chat: forget this session on the server, then clear the page
+            async function newChat() {
+                if (sessionId) {
+                    try {
+                        await fetch("/clear?session_id=" + encodeURIComponent(sessionId), { method: "POST" });
+                    } catch (e) {
+                        // Not fatal: a fresh session starts below either way
+                    }
+                }
+                sessionId = null;
+                messages.replaceChildren();
+                userInput.value = "";
+                userInput.focus();
+            }
+
             async function send() {
                 const text = userInput.value.trim();
                 if (!text) return;
 
                 userInput.value = "";
                 sendBtn.disabled = true;
+                newChatBtn.disabled = true;
                 setStatus(true);
                 addMessage("you", text);
                 const loading = addMessage("assistant", "Thinking", true);
@@ -359,18 +459,7 @@
 
                     // Show each tool the harness ran, above the assistant's answer
                     for (const call of data.tool_calls || []) {
-                        const div = document.createElement("div");
-                        div.className = "tool";
-                        const label = document.createElement("span");
-                        label.className = "label";
-                        label.textContent = "tool call  ";
-                        div.appendChild(label);
-                        div.appendChild(
-                            document.createTextNode(
-                                call.name + "(" + JSON.stringify(call.args) + ")\n→ " + call.result,
-                            ),
-                        );
-                        messages.insertBefore(div, loading);
+                        messages.insertBefore(renderToolCall(call), loading);
                     }
                     showReply(loading.querySelector(".content"), data.response);
                     loading.classList.remove("loading");
@@ -382,10 +471,12 @@
                 messages.scrollTop = messages.scrollHeight;
                 setStatus(false);
                 sendBtn.disabled = false;
+                newChatBtn.disabled = false;
                 userInput.focus();
             }
 
             sendBtn.addEventListener("click", send);
+            newChatBtn.addEventListener("click", newChat);
             userInput.addEventListener("keydown", function (e) {
                 if (e.key === "Enter") send();
             });
