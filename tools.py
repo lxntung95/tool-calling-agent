@@ -19,6 +19,8 @@ VIRUSES = {"COVID-19": "sars", "Influenza A": "influenza a", "RSV": "rsv"}
 TREND_WEEKS = 3        # trend compares a week with this many weeks earlier
 MAX_LOCAL_LAG_WEEKS = 3  # county data may be up to this many weeks older than the state's newest week
 WEEKS_OF_HISTORY = TREND_WEEKS + MAX_LOCAL_LAG_WEEKS + 1  # how far back tool 1 fetches
+MIN_SITES_TO_RANK = 5  # states with fewer reporting sites are left out of national rankings (too noisy)
+HIGH_LEVELS = {"High", "Very High"}  # CDC categories counted as elevated in rankings
 
 
 # --- HELPERS (shared by tools; the model never sees these) ---
@@ -270,6 +272,81 @@ def get_historical_comparison(location: str, virus: str, weeks_ago: int = 52) ->
     })
 
 
+def get_national_rankings(virus: str, top_n: int = 5, order: str = "highest") -> str:
+    """Rank US states by the share of their wastewater sites at High or Very High for one virus."""
+    if virus not in VIRUSES:
+        return json.dumps({"error": f"Unknown virus '{virus}'. Use one of: {list(VIRUSES)}."})
+    if order not in ("highest", "lowest"):
+        return json.dumps({"error": "order must be 'highest' or 'lowest'."})
+    top_n = max(1, min(int(top_n), 20))  # keep the answer readable
+
+    prefix_filter = f"lower(pathogen_target) like '{VIRUSES[virus]}%'"
+    try:
+        latest = query_cdc({"$select": "max(week_end) AS latest", "$where": prefix_filter})
+        latest_week = (latest[0].get("latest") or "")[:10] if latest else ""
+        if not latest_week:
+            return json.dumps({"error": f"No {virus} data is available nationally right now."})
+        # A few recent weeks, since states report on different schedules
+        start = (date.fromisoformat(latest_week) - timedelta(weeks=MAX_LOCAL_LAG_WEEKS)).isoformat()
+        rows = query_cdc({
+            "$select": "state_territory, site, site_wval, site_wval_category, week_end",
+            "$where": f"{prefix_filter} AND week_end >= '{start}'",
+            "$limit": 50000,
+        })
+    except requests.RequestException as e:
+        return json.dumps({"error": f"The CDC data service did not respond ({type(e).__name__}). Tell the user it is temporarily unavailable; do not retry more than once."})
+
+    # Group rows by state, keeping only each state's own newest week
+    by_state: dict[str, list[dict]] = {}
+    for r in rows:
+        r["week"] = (r.get("week_end") or "")[:10]
+        by_state.setdefault(r.get("state_territory") or "Unknown", []).append(r)
+
+    ranked, too_few, all_current = [], [], []
+    for state, state_rows in by_state.items():
+        week = max(r["week"] for r in state_rows)
+        current = [r for r in state_rows if r["week"] == week]
+        all_current += current  # every state counts toward national context, even ones too small to rank
+        if len(current) < MIN_SITES_TO_RANK:
+            too_few.append(state)
+            continue
+        high = sum(1 for r in current if r.get("site_wval_category") in HIGH_LEVELS)
+        ranked.append({
+            "state": state,
+            "week_ending": week,
+            "sites_reporting": len(current),
+            "percent_sites_high_or_very_high": round(100 * high / len(current)),
+            "median_site_level": median_level(current, week),
+        })
+
+    # Primary sort: share of elevated sites; tiebreaker: median site level
+    ranked.sort(
+        key=lambda s: (s["percent_sites_high_or_very_high"], s["median_site_level"] or 0),
+        reverse=(order == "highest"),
+    )
+    for i, s in enumerate(ranked, start=1):
+        s["rank"] = i
+        if s["median_site_level"] is not None:
+            s["median_site_level"] = round(s["median_site_level"], 1)
+
+    national_high = sum(1 for r in all_current if r.get("site_wval_category") in HIGH_LEVELS)
+    return json.dumps({
+        "virus": virus,
+        "order": order,
+        "newest_national_week": latest_week,
+        # National context, so a "top" state is not mistaken for a hotspot when activity is low everywhere
+        "national_sites_reporting": len(all_current),
+        "national_percent_sites_high_or_very_high": round(100 * national_high / len(all_current)) if all_current else None,
+        "states": ranked[:top_n],
+        "states_ranked": len(ranked),
+        "method": (
+            f"States ranked by the percent of their reporting sites at High or Very High in their newest week, "
+            f"with median site level as a tiebreaker. States with fewer than {MIN_SITES_TO_RANK} reporting sites "
+            f"are not ranked ({len(too_few)} left out)."
+        ),
+    })
+
+
 # --- TOOL DEFINITIONS: what the model sees ("set notes" in the screenplay) ---
 
 TOOLS = [
@@ -328,12 +405,45 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_national_rankings",
+            "description": (
+                "Rank US states by current wastewater activity for one virus: the percent of each state's sampling sites "
+                "at the CDC's High or Very High level, with median site level as a tiebreaker. Use this for questions like "
+                "'where is RSV highest right now?' or 'which states have the least COVID?'. Not for a single place; "
+                "use get_current_activity for that."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "virus": {
+                        "type": "string",
+                        "enum": list(VIRUSES),
+                        "description": "Which virus to rank states by",
+                    },
+                    "top_n": {
+                        "type": "integer",
+                        "description": "How many states to return, 1 to 20. Default 5.",
+                    },
+                    "order": {
+                        "type": "string",
+                        "enum": ["highest", "lowest"],
+                        "description": "'highest' for where activity is worst, 'lowest' for where it is least. Default 'highest'.",
+                    },
+                },
+                "required": ["virus"],
+            },
+        },
+    },
 ]
 
 # What the harness runs: tool name -> Python function
 TOOL_MAP = {
     "get_current_activity": get_current_activity,
     "get_historical_comparison": get_historical_comparison,
+    "get_national_rankings": get_national_rankings,
 }
 
 # Fail at startup, not mid-conversation, if a schema and the map disagree
