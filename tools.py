@@ -70,6 +70,58 @@ def serves_county(row: dict, county: str) -> bool:
     return county.lower() in (c.strip().lower() for c in served.split(","))
 
 
+def fetch_state_rows(state: str, start: str, end: str | None = None) -> list[dict]:
+    """All rows for one state with week_end in [start, end]; adds a normalized 'week' (YYYY-MM-DD) to each row."""
+    where = f"state_territory = {soql_text(state)} AND week_end >= '{start}'"
+    if end:
+        where += f" AND week_end <= '{end}'"
+    rows = query_cdc({
+        "$select": "site, counties_served, pathogen_target, site_wval, site_wval_category, week_end",
+        "$where": where,
+        "$limit": 50000,
+    })
+    for r in rows:
+        r["week"] = (r.get("week_end") or "")[:10]  # "2026-09-19T00:00:00.000" -> "2026-09-19"
+    return rows
+
+
+def newest_week(state: str) -> str:
+    """Newest week_end with any data for the state, as YYYY-MM-DD ('' if none)."""
+    latest = query_cdc({"$select": "max(week_end) AS latest", "$where": f"state_territory = {soql_text(state)}"})
+    return (latest[0].get("latest") or "")[:10] if latest else ""
+
+
+def closest_week(rows: list[dict], target: str) -> str:
+    """The week in rows nearest to the target date ('' if rows is empty)."""
+    weeks = {r["week"] for r in rows}
+    t = date.fromisoformat(target)
+    return min(weeks, key=lambda w: abs((date.fromisoformat(w) - t).days), default="")
+
+
+def median_level(rows: list[dict], week: str, sites: set[str] | None = None) -> float | None:
+    """Median site_wval for one week, optionally only for the given sites."""
+    values = []
+    for r in rows:
+        if r["week"] != week or (sites is not None and r.get("site") not in sites):
+            continue
+        try:
+            values.append(float(r["site_wval"]))
+        except (KeyError, TypeError, ValueError):
+            pass  # a site without a numeric level that week is skipped
+    return median(values) if values else None
+
+
+def direction(now: float | None, before: float | None, up: str, down: str, same: str) -> str:
+    """Label a change using a 20% band: above -> up, below -> down, within -> same."""
+    if now is None or not before:
+        return "unknown (not enough data)"
+    if now > before * 1.2:
+        return up
+    if now < before / 1.2:
+        return down
+    return same
+
+
 def rows_for_virus(rows: list[dict], virus_prefix: str) -> list[dict]:
     """Keep only rows whose pathogen_target starts with the virus prefix (e.g. 'sars')."""
     return [r for r in rows if (r.get("pathogen_target") or "").lower().startswith(virus_prefix)]
@@ -79,26 +131,8 @@ def summarize_week(rows: list[dict], week: str) -> dict:
     """Site-level summary for one virus in one week: CDC category counts plus a median-based trend."""
     prior_week = (date.fromisoformat(week) - timedelta(weeks=TREND_WEEKS)).isoformat()
 
-    def median_level(w: str) -> float | None:
-        values = []
-        for r in rows:
-            if r["week"] != w:
-                continue
-            try:
-                values.append(float(r["site_wval"]))
-            except (KeyError, TypeError, ValueError):
-                pass  # a site without a numeric level that week is skipped
-        return median(values) if values else None
-
-    now, before = median_level(week), median_level(prior_week)
-    if now is None or not before:
-        trend = "unknown (not enough earlier data)"
-    elif now > before * 1.2:   # more than 20% higher than 3 weeks earlier
-        trend = "rising"
-    elif now < before / 1.2:   # more than 20% lower
-        trend = "falling"
-    else:
-        trend = "steady"
+    now, before = median_level(rows, week), median_level(rows, prior_week)
+    trend = direction(now, before, "rising", "falling", "steady")
 
     current = [r for r in rows if r["week"] == week]
     categories = Counter(r.get("site_wval_category") or "Unknown" for r in current)
@@ -120,27 +154,16 @@ def get_current_activity(location: str) -> str:
         return json.dumps({"error": str(e)})
 
     try:
-        state = soql_text(place["state"])
-        # 1. Newest week this state has data for
-        latest = query_cdc({"$select": "max(week_end) AS latest", "$where": f"state_territory = {state}"})
-        latest_week = (latest[0].get("latest") or "")[:10] if latest else ""
+        latest_week = newest_week(place["state"])
         if not latest_week:
             return json.dumps({"error": f"No wastewater data is reported for {place['state']}. Try a nearby state."})
-
-        # 2. Only this state's rows for the last few weeks (the full dataset is too large to download)
-        cutoff = (date.fromisoformat(latest_week) - timedelta(weeks=WEEKS_OF_HISTORY)).isoformat()
-        rows = query_cdc({
-            "$select": "site, counties_served, pathogen_target, site_wval, site_wval_category, week_end",
-            "$where": f"state_territory = {state} AND week_end >= '{cutoff}'",
-            "$limit": 50000,
-        })
+        # Only this state's recent rows (the full dataset is too large to download)
+        start = (date.fromisoformat(latest_week) - timedelta(weeks=WEEKS_OF_HISTORY)).isoformat()
+        rows = fetch_state_rows(place["state"], start)
     except requests.RequestException as e:
         return json.dumps({"error": f"The CDC data service did not respond ({type(e).__name__}). Tell the user it is temporarily unavailable; do not retry more than once."})
 
-    for r in rows:
-        r["week"] = (r.get("week_end") or "")[:10]  # normalize "2026-09-19T00:00:00.000" -> "2026-09-19"
-
-    # 3. Per virus: use the county's own newest week if it is recent enough, else fall back to the whole state
+    # Per virus: use the county's own newest week if it is recent enough, else fall back to the whole state
     county = county_at(place["lat"], place["lon"])
     freshness_cutoff = (date.fromisoformat(latest_week) - timedelta(weeks=MAX_LOCAL_LAG_WEEKS)).isoformat()
     viruses = {}
@@ -167,6 +190,84 @@ def get_current_activity(location: str) -> str:
         viruses[virus] = summary
 
     return json.dumps({"place": f"{place['name']}, {place['state']}", "county": county, "viruses": viruses})
+
+
+def get_historical_comparison(location: str, virus: str, weeks_ago: int = 52) -> str:
+    """Compare one virus's wastewater level at a US place now versus weeks_ago weeks earlier."""
+    if virus not in VIRUSES:
+        return json.dumps({"error": f"Unknown virus '{virus}'. Use one of: {list(VIRUSES)}."})
+    if not 1 <= weeks_ago <= 156:
+        return json.dumps({"error": "weeks_ago must be between 1 and 156 (3 years). Use 52 for 'this time last year'."})
+    try:
+        place = geocode(location)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+    try:
+        latest_week = newest_week(place["state"])
+        if not latest_week:
+            return json.dumps({"error": f"No wastewater data is reported for {place['state']}. Try a nearby state."})
+        latest = date.fromisoformat(latest_week)
+        target = latest - timedelta(weeks=weeks_ago)
+        # Two small windows instead of everything in between: recent weeks, and a few weeks around the target date
+        recent = fetch_state_rows(place["state"], (latest - timedelta(weeks=MAX_LOCAL_LAG_WEEKS)).isoformat())
+        # Past window is wide enough to cover a county that lags the state by up to MAX_LOCAL_LAG_WEEKS
+        past_start = target - timedelta(weeks=2 + MAX_LOCAL_LAG_WEEKS)
+        past = fetch_state_rows(place["state"], past_start.isoformat(), (target + timedelta(weeks=2)).isoformat())
+    except requests.RequestException as e:
+        return json.dumps({"error": f"The CDC data service did not respond ({type(e).__name__}). Tell the user it is temporarily unavailable; do not retry more than once."})
+
+    prefix = VIRUSES[virus]
+    recent, past = rows_for_virus(recent, prefix), rows_for_virus(past, prefix)
+    if not recent:
+        return json.dumps({"error": f"No recent {virus} data for {place['state']}; its sites may not test for {virus}. Try another virus or a nearby state."})
+    if not past:
+        return json.dumps({"error": f"No {virus} data for {place['state']} around {target.isoformat()}. Try a smaller weeks_ago."})
+
+    # Use the county only if it has data in BOTH periods, so the two readings cover the same area
+    county = county_at(place["lat"], place["lon"])
+    county_recent = [r for r in recent if county and serves_county(r, county)]
+    county_past = [r for r in past if county and serves_county(r, county)]
+    if county_recent and county_past:
+        area, recent, past = f"{county} County", county_recent, county_past
+    else:
+        area = f"all of {place['state']}"
+
+    now_week = max(r["week"] for r in recent)
+    # Measure weeks_ago from the week actually used, which can lag the state's newest week
+    then_week = closest_week(past, (date.fromisoformat(now_week) - timedelta(weeks=weeks_ago)).isoformat())
+
+    # Like-for-like: prefer sites that reported in both weeks, since the set of sites changes over time
+    sites_now = {r.get("site") for r in recent if r["week"] == now_week}
+    sites_then = {r.get("site") for r in past if r["week"] == then_week}
+    shared = {s for s in sites_now & sites_then if s}
+    basis = f"the same {len(shared)} site(s) in both weeks" if shared else "different sets of sites in each week"
+    compare_sites = shared or None
+
+    level_now = median_level(recent, now_week, compare_sites)
+    level_then = median_level(past, then_week, compare_sites)
+
+    def snapshot(rows: list[dict], week: str) -> dict:
+        current = [r for r in rows if r["week"] == week]
+        return {
+            "week_ending": week,
+            "sites_reporting": len(current),
+            "sites_by_level": dict(Counter(r.get("site_wval_category") or "Unknown" for r in current).most_common()),
+        }
+
+    return json.dumps({
+        "place": f"{place['name']}, {place['state']}",
+        "virus": virus,
+        "area_used": area,
+        "note": None if area.endswith("County") else f"{county or 'This'} County lacked data in one of the periods, so both readings are statewide.",
+        "now": snapshot(recent, now_week),
+        "then": snapshot(past, then_week),
+        "change": direction(level_now, level_then, "higher now", "lower now", "about the same"),
+        "change_basis": (
+            f"median site level {level_now:.1f} now vs {level_then:.1f} then, using {basis}"
+            if level_now is not None and level_then is not None else None
+        ),
+    })
 
 
 # --- TOOL DEFINITIONS: what the model sees ("set notes" in the screenplay) ---
@@ -196,10 +297,44 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_historical_comparison",
+            "description": (
+                "Compare one virus's wastewater activity at a US place now versus a past week, e.g. 'this time last year'. "
+                "Returns the CDC level counts for both weeks and whether activity is higher, lower, or about the same. "
+                "Compares the same sampling sites across both weeks when possible. Use this for any question about "
+                "how current levels compare with the past; use get_current_activity for the current situation alone."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "US city or county with its full state name, e.g. 'Brooklyn, New York'",
+                    },
+                    "virus": {
+                        "type": "string",
+                        "enum": list(VIRUSES),
+                        "description": "Which virus to compare",
+                    },
+                    "weeks_ago": {
+                        "type": "integer",
+                        "description": "How many weeks back to compare with: 52 for this time last year, 4 for about a month ago. Between 1 and 156.",
+                    },
+                },
+                "required": ["location", "virus"],
+            },
+        },
+    },
 ]
 
 # What the harness runs: tool name -> Python function
-TOOL_MAP = {"get_current_activity": get_current_activity}
+TOOL_MAP = {
+    "get_current_activity": get_current_activity,
+    "get_historical_comparison": get_historical_comparison,
+}
 
 # Fail at startup, not mid-conversation, if a schema and the map disagree
 assert {t["function"]["name"] for t in TOOLS} == set(TOOL_MAP), "TOOLS and TOOL_MAP names don't match"
