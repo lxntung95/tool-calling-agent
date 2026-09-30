@@ -16,7 +16,10 @@ CDC_WVAL_URL = "https://data.cdc.gov/resource/atcp-73re.json"   # CDC NWSS site-
 NPI_URL = "https://npiregistry.cms.hhs.gov/api/"                # CMS registry of licensed healthcare providers
 
 # Care types the model can ask for -> NPI taxonomy search term (matches "Pharmacy", "Clinic/Center, Urgent Care")
-CARE_TYPES = {"pharmacy": "pharmacy", "urgent care": "urgent care"}
+CARE_TYPES = {
+    "pharmacy": "pharmacy",
+    "urgent care": "urgent care"
+}
 
 # Emerging threats: CDC sample-level datasets that record whether each sample detected the virus
 EMERGING_THREATS = {
@@ -50,13 +53,13 @@ STATE_BY_LOWER = {name.lower(): name for name in US_STATES}
 # The three viruses in the dataset, matched by how their pathogen_target text starts
 VIRUSES = {"COVID-19": "sars", "Influenza A": "influenza a", "RSV": "rsv"}
 
-TREND_WEEKS = 3        # trend compares a week with this many weeks earlier
-MAX_LOCAL_LAG_WEEKS = 3  # county data may be up to this many weeks older than the state's newest week
+TREND_WEEKS = 3                                           # trend compares a week with this many weeks earlier
+MAX_LOCAL_LAG_WEEKS = 3                                   # county data may be up to this many weeks older than the state's newest week
 WEEKS_OF_HISTORY = TREND_WEEKS + MAX_LOCAL_LAG_WEEKS + 1  # how far back tool 1 fetches
-MIN_SITES_TO_RANK = 5  # states with fewer reporting sites are left out of national rankings (too noisy)
-HIGH_LEVELS = {"High", "Very High"}  # CDC categories counted as elevated in rankings
-EMERGING_WINDOW_WEEKS = 6  # look-back for detections; CDC's own display uses the past six weeks
-NPI_FETCH_LIMIT = 200      # the registry's maximum per request
+MIN_SITES_TO_RANK = 5                                     # states with fewer reporting sites are left out of national rankings (too noisy)
+HIGH_LEVELS = {"High", "Very High"}                       # CDC categories counted as elevated in rankings
+EMERGING_WINDOW_WEEKS = 6                                 # look-back for detections; CDC's own display uses the past six weeks
+NPI_FETCH_LIMIT = 200                                     # the registry's maximum per request
 
 
 # --- HELPERS (shared by tools; the model never sees these) ---

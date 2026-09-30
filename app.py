@@ -15,7 +15,7 @@ from tools import TOOLS, run_tool
 
 # --- CONFIGURATION ---
 
-# Instructions sent as the first message of every session; add one routing line per tool as each tool is built
+# Instructions sent as the first message of every session
 SYSTEM_PROMPT = """You are Viral Pulse, an assistant that reports how much COVID-19, influenza A, and RSV \
 is circulating in US communities, and recent wastewater detections of measles and H5 bird flu, \
 based on CDC wastewater surveillance data.
