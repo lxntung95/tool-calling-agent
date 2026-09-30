@@ -185,6 +185,42 @@
                 animation: pulse 0.9s steps(1) infinite;
             }
 
+            /* Welcome block on an empty conversation, centered vertically in the message area */
+            #welcome {
+                margin-block: auto;
+                padding-block: 1rem;
+            }
+            #welcome h2 {
+                font-size: 1.15rem;
+                font-weight: 600;
+                margin-bottom: 0.5rem;
+            }
+            #welcome p {
+                color: var(--muted);
+                line-height: 1.6;
+                max-width: 60ch;
+                margin-bottom: 1.25rem;
+            }
+            #examples {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 0.6rem;
+            }
+            /* Example questions: outlined like New chat, so Send stays the only filled accent */
+            .example {
+                padding: 0.55rem 0.9rem;
+                background: transparent;
+                color: var(--text);
+                border: 1px solid var(--border);
+                font-weight: 400;
+                font-size: 0.9rem;
+                text-align: left;
+            }
+            .example:hover {
+                border-color: var(--accent-line);
+                filter: none;
+            }
+
             /* Formatting inside rendered replies (lists, paragraphs, bold) */
             .content p + p,
             .content p + ul,
@@ -323,7 +359,7 @@
         </style>
     </head>
     <body>
-        <!-- STRUCTURE: header bar (name, description, status, New chat), conversation, input bar -->
+        <!-- STRUCTURE: header bar (name, description, status, New chat), conversation (welcome + examples when empty), input bar -->
         <header id="header">
             <div class="inner">
                 <div>
@@ -336,7 +372,23 @@
                 </div>
             </div>
         </header>
-        <main id="messages"></main>
+        <main id="messages">
+            <!-- Shown on an empty conversation; removed on the first message, restored by New chat -->
+            <section id="welcome">
+                <h2>Ask about any US city, county, or state</h2>
+                <p>
+                    Find out how much COVID-19, flu, and RSV is circulating, compare places or past weeks,
+                    check for measles or bird flu, or find a nearby pharmacy. Data comes from CDC wastewater
+                    surveillance and updates weekly.
+                </p>
+                <div id="examples">
+                    <button type="button" class="example">What is the COVID situation in Brooklyn this week?</button>
+                    <button type="button" class="example">Where is RSV highest in the country right now?</button>
+                    <button type="button" class="example">Has measles been detected in California recently?</button>
+                    <button type="button" class="example">Where can I get a flu shot near Astoria, Queens?</button>
+                </div>
+            </section>
+        </main>
         <footer id="input-bar">
             <div class="inner">
                 <input
@@ -356,6 +408,7 @@
             const sendBtn = document.getElementById("send-btn");
             const statusEl = document.getElementById("status");
             const newChatBtn = document.getElementById("new-chat-btn");
+            const welcome = document.getElementById("welcome");
             let sessionId = null;
 
             // Header status: "Working" while waiting on the agent, "Ready" otherwise
@@ -429,7 +482,7 @@
                     }
                 }
                 sessionId = null;
-                messages.replaceChildren();
+                messages.replaceChildren(welcome); // back to the empty state with example questions
                 userInput.value = "";
                 userInput.focus();
             }
@@ -438,6 +491,7 @@
                 const text = userInput.value.trim();
                 if (!text) return;
 
+                welcome.remove(); // the conversation has started
                 userInput.value = "";
                 sendBtn.disabled = true;
                 newChatBtn.disabled = true;
@@ -477,6 +531,14 @@
 
             sendBtn.addEventListener("click", send);
             newChatBtn.addEventListener("click", newChat);
+
+            // Clicking an example question sends it as if the user typed it
+            for (const button of document.querySelectorAll(".example")) {
+                button.addEventListener("click", function () {
+                    userInput.value = button.textContent;
+                    send();
+                });
+            }
             userInput.addEventListener("keydown", function (e) {
                 if (e.key === "Enter") send();
             });
